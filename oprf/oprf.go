@@ -41,6 +41,9 @@
 // All three modes can perform batches of PRF evaluations, so passing an array
 // of inputs will produce an array of outputs.
 //
+// Warning: Server operations for the SuiteP256, SuiteP384, and SuiteP521
+// suites are currently not constant time in the server's private key.
+//
 // # References
 //
 // [1] RFC-9497: https://www.rfc-editor.org/info/rfc9497
@@ -115,7 +118,7 @@ func NewClient(s Suite) Client {
 
 func NewVerifiableClient(s Suite, server *PublicKey) VerifiableClient {
 	p, ok := s.(params)
-	if !ok || server == nil {
+	if !ok || server == nil || server.e == nil || server.e.IsIdentity() {
 		panic(ErrNoKey)
 	}
 	p.m = VerifiableMode
@@ -125,7 +128,7 @@ func NewVerifiableClient(s Suite, server *PublicKey) VerifiableClient {
 
 func NewPartialObliviousClient(s Suite, server *PublicKey) PartialObliviousClient {
 	p, ok := s.(params)
-	if !ok || server == nil {
+	if !ok || server == nil || server.e == nil || server.e.IsIdentity() {
 		panic(ErrNoKey)
 	}
 	p.m = PartialObliviousMode
@@ -251,6 +254,8 @@ var (
 	ErrInvalidProof       = errors.New("oprf: proof verification failed")
 	ErrInverseZero        = errors.New("oprf: inverting a zero value")
 	ErrNoKey              = errors.New("oprf: must provide a key")
+	ErrInvalidPublicKey   = errors.New("oprf: invalid public key")
+	ErrInvalidPrivateKey  = errors.New("oprf: invalid private key")
 )
 
 type (

@@ -41,6 +41,7 @@ import (
 var (
 	ErrInvalid    = errors.New("bls: invalid BLS instance")
 	ErrInvalidKey = errors.New("bls: invalid key")
+	ErrInvalidSig = errors.New("bls: invalid signature")
 	ErrKeyGen     = errors.New("bls: too many unsuccessful key generation tries")
 	ErrShortIKM   = errors.New("bls: IKM material shorter than 32 bytes")
 	ErrAggregate  = errors.New("bls: error while aggregating signatures")
@@ -64,8 +65,39 @@ type (
 	KeyG2SigG1 = G2
 )
 
-func (f *G1) setBytes(b []byte) error { return f.g.SetBytes(b) }
-func (f *G2) setBytes(b []byte) error { return f.g.SetBytes(b) }
+func (f *G1) setBytes(b []byte) error {
+	if len(b) == 0 || b[0]&0xC0 != 0x80 {
+		return ErrInvalidSig
+	}
+
+	err := f.g.SetBytes(b)
+	if err != nil {
+		return err
+	}
+
+	if f.g.IsIdentity() {
+		return ErrInvalidSig
+	}
+
+	return nil
+}
+
+func (f *G2) setBytes(b []byte) error {
+	if len(b) == 0 || b[0]&0xC0 != 0x80 {
+		return ErrInvalidSig
+	}
+
+	err := f.g.SetBytes(b)
+	if err != nil {
+		return err
+	}
+
+	if f.g.IsIdentity() {
+		return ErrInvalidSig
+	}
+
+	return nil
+}
 
 func (f *G1) hash(msg []byte) { f.g.Hash(msg, []byte(dstG1)) }
 func (f *G2) hash(msg []byte) { f.g.Hash(msg, []byte(dstG2)) }
@@ -331,24 +363,26 @@ func Aggregate[K KeyGroup](k K, sigs []Signature) (Signature, error) {
 
 	switch any(k).(type) {
 	case G1:
-		var P, Q GG.G2
+		var P GG.G2
+		var Q G2
 		P.SetIdentity()
 		for _, sig := range sigs {
-			if err := Q.SetBytes(sig); err != nil {
+			if err := Q.setBytes(sig); err != nil {
 				return nil, err
 			}
-			P.Add(&P, &Q)
+			P.Add(&P, &Q.g)
 		}
 		return P.BytesCompressed(), nil
 
 	case G2:
-		var P, Q GG.G1
+		var P GG.G1
+		var Q G1
 		P.SetIdentity()
 		for _, sig := range sigs {
-			if err := Q.SetBytes(sig); err != nil {
+			if err := Q.setBytes(sig); err != nil {
 				return nil, err
 			}
-			P.Add(&P, &Q)
+			P.Add(&P, &Q.g)
 		}
 		return P.BytesCompressed(), nil
 
@@ -403,10 +437,11 @@ func VerifyAggregate[K KeyGroup](pubs []*PublicKey[K], msgs [][]byte, aggSig Sig
 			listSigns[i] = 1
 		}
 
-		err := listG2[n].SetBytes(aggSig)
-		if err != nil {
+		var sig G2
+		if err := sig.setBytes(aggSig); err != nil {
 			return false
 		}
+		listG2[n] = &sig.g
 
 	case []*PublicKey[G2]:
 		for i := range msgs {
@@ -418,10 +453,11 @@ func VerifyAggregate[K KeyGroup](pubs []*PublicKey[K], msgs [][]byte, aggSig Sig
 			listSigns[i] = 1
 		}
 
-		err := listG1[n].SetBytes(aggSig)
-		if err != nil {
+		var sig G1
+		if err := sig.setBytes(aggSig); err != nil {
 			return false
 		}
+		listG1[n] = &sig.g
 
 	default:
 		panic(ErrInvalid)

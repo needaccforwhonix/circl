@@ -248,6 +248,146 @@ func TestErrors(t *testing.T) {
 	})
 }
 
+func TestDeterministicBlindRejectsInvalidBlind(t *testing.T) {
+	for _, suite := range []Suite{
+		SuiteRistretto255,
+		SuiteP256,
+		SuiteP384,
+		SuiteP521,
+	} {
+		t.Run(suite.(fmt.Stringer).String(), func(t *testing.T) {
+			client := NewClient(suite)
+			for _, tc := range []struct {
+				name  string
+				blind Blind
+			}{
+				{"nil", nil},
+				{"zero", suite.Group().NewScalar()},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					finData, evalReq, err := client.DeterministicBlind(
+						[][]byte{[]byte("input")}, []Blind{tc.blind})
+					if err != ErrInvalidInput || finData != nil || evalReq != nil {
+						t.Fatalf("got finalize data %v, request %v, and error %v; want nil, nil, and %v",
+							finData, evalReq, err, ErrInvalidInput)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestFinalizeRejectsMalformedState(t *testing.T) {
+	key, err := GenerateKey(SuiteP256, rand.Reader)
+	test.CheckNoErr(t, err, "failed private key generation")
+	info := []byte("shared info")
+	clients := []struct {
+		name   string
+		client commonClient
+	}{
+		{"OPRF", NewClient(SuiteP256)},
+		{"VOPRF", NewVerifiableClient(SuiteP256, key.Public())},
+		{"POPRF", &c1{NewPartialObliviousClient(SuiteP256, key.Public()), info}},
+	}
+
+	for _, tc := range clients {
+		t.Run(tc.name, func(t *testing.T) {
+			newFinalizeData := func(t *testing.T) *FinalizeData {
+				t.Helper()
+				f, _, err := tc.client.Blind([][]byte{[]byte("input")})
+				test.CheckNoErr(t, err, "blind failed")
+				return f
+			}
+			goodEvaluation := func() *Evaluation {
+				return &Evaluation{Elements: []Evaluated{group.P256.Generator()}}
+			}
+
+			tests := []struct {
+				name string
+				f    func(*FinalizeData)
+				e    *Evaluation
+			}{
+				{"nil evaluation", nil, nil},
+				{"nil request", func(f *FinalizeData) { f.evalReq = nil }, goodEvaluation()},
+				{"nil blind", func(f *FinalizeData) { f.blinds[0] = nil }, goodEvaluation()},
+				{"wrong-group blind", func(f *FinalizeData) { f.blinds[0] = group.P384.NewScalar() }, goodEvaluation()},
+				{"nil request element", func(f *FinalizeData) { f.evalReq.Elements[0] = nil }, goodEvaluation()},
+				{"identity request element", func(f *FinalizeData) { f.evalReq.Elements[0] = group.P256.Identity() }, goodEvaluation()},
+				{"wrong-group request element", func(f *FinalizeData) { f.evalReq.Elements[0] = group.P384.Generator() }, goodEvaluation()},
+				{"nil evaluated element", nil, &Evaluation{Elements: []Evaluated{nil}}},
+				{"identity evaluated element", nil, &Evaluation{Elements: []Evaluated{group.P256.Identity()}}},
+				{"wrong-group evaluated element", nil, &Evaluation{Elements: []Evaluated{group.P384.Generator()}}},
+			}
+			for _, malformed := range tests {
+				t.Run(malformed.name, func(t *testing.T) {
+					f := newFinalizeData(t)
+					if malformed.f != nil {
+						malformed.f(f)
+					}
+					if out, err := tc.client.Finalize(f, malformed.e); err != ErrInvalidInput || out != nil {
+						t.Fatalf("got output %v and error %v, want nil and %v", out, err, ErrInvalidInput)
+					}
+				})
+			}
+
+			if out, err := tc.client.Finalize(nil, goodEvaluation()); err != ErrInvalidInput || out != nil {
+				t.Fatalf("nil finalize data: got output %v and error %v, want nil and %v",
+					out, err, ErrInvalidInput)
+			}
+		})
+	}
+}
+
+// TestIdentityKeyRejection ensures the OPRF parsing boundary rejects the
+// identity public key and the zero private key, as required by RFC 9497.
+// Accepting them would let an attacker impersonate a verifiable OPRF server
+// without a secret key (see ZK-dfh985d3).
+func TestIdentityKeyRejection(t *testing.T) {
+	suites := []Suite{SuiteRistretto255, SuiteP256, SuiteP384, SuiteP521}
+	for _, suite := range suites {
+		t.Run(suite.Identifier(), func(t *testing.T) {
+			g := suite.Group()
+
+			// Serialized identity element must be rejected as a public key.
+			identity, err := g.Identity().MarshalBinaryCompress()
+			test.CheckNoErr(t, err, "failed to marshal identity")
+			err = new(PublicKey).UnmarshalBinary(suite, identity)
+			test.CheckIsErr(t, err, "must reject identity public key")
+			if err != ErrInvalidPublicKey {
+				t.Fatalf("expected ErrInvalidPublicKey, got %v", err)
+			}
+
+			// Serialized zero scalar must be rejected as a private key.
+			zero, err := g.NewScalar().MarshalBinary()
+			test.CheckNoErr(t, err, "failed to marshal zero scalar")
+			err = new(PrivateKey).UnmarshalBinary(suite, zero)
+			test.CheckIsErr(t, err, "must reject zero private key")
+			if err != ErrInvalidPrivateKey {
+				t.Fatalf("expected ErrInvalidPrivateKey, got %v", err)
+			}
+
+			// Constructors must reject an identity public key defensively.
+			idKey := &PublicKey{suite.(params), g.Identity()}
+			err = test.CheckPanic(func() { NewVerifiableClient(suite, idKey) })
+			test.CheckNoErr(t, err, "verifiable client must reject identity key")
+			err = test.CheckPanic(func() { NewPartialObliviousClient(suite, idKey) })
+			test.CheckNoErr(t, err, "partial oblivious client must reject identity key")
+
+			// A valid key must still round-trip and be accepted.
+			priv, err := GenerateKey(suite, rand.Reader)
+			test.CheckNoErr(t, err, "failed to generate key")
+			pubBytes, err := priv.Public().MarshalBinary()
+			test.CheckNoErr(t, err, "failed to marshal public key")
+			err = new(PublicKey).UnmarshalBinary(suite, pubBytes)
+			test.CheckNoErr(t, err, "valid public key must be accepted")
+			privBytes, err := priv.MarshalBinary()
+			test.CheckNoErr(t, err, "failed to marshal private key")
+			err = new(PrivateKey).UnmarshalBinary(suite, privBytes)
+			test.CheckNoErr(t, err, "valid private key must be accepted")
+		})
+	}
+}
+
 func Example_oprf() {
 	suite := SuiteP256
 	//                                  Server(sk, pk, info*)

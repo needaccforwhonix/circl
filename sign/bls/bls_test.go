@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cloudflare/circl/ecc/bls12381"
 	"github.com/cloudflare/circl/internal/test"
 	"github.com/cloudflare/circl/sign/bls"
 )
@@ -23,6 +24,74 @@ func TestBls(t *testing.T) {
 	t.Run("G2/Aggregation", testAggregation[bls.G2])
 	t.Run("G1/DuplicatedMsg", testDuplicatedMsgs[bls.G1])
 	t.Run("G2/DuplicatedMsg", testDuplicatedMsgs[bls.G2])
+	t.Run("G1/NonCanonical", testNonCanonical[bls.G1])
+	t.Run("G2/NonCanonical", testNonCanonical[bls.G2])
+	t.Run("G1/CompressedOnly", testCompressedOnly[bls.G1])
+	t.Run("G2/CompressedOnly", testCompressedOnly[bls.G2])
+}
+
+func testCompressedOnly[K bls.KeyGroup](t *testing.T) {
+	ikm := [32]byte{}
+	priv, err := bls.KeyGen[K](ikm[:], nil, nil)
+	test.CheckNoErr(t, err, "failed to keygen")
+	pub := priv.PublicKey()
+	msg := []byte("hello world")
+	sig := bls.Sign(priv, msg)
+	pubBytes, err := pub.MarshalBinary()
+	test.CheckNoErr(t, err, "failed to marshal public key")
+
+	var uncompressedPub, uncompressedSig []byte
+	switch any(*new(K)).(type) {
+	case bls.G1:
+		var pubPoint bls12381.G1
+		test.CheckNoErr(t, pubPoint.SetBytes(pubBytes), "failed to decode public key")
+		uncompressedPub = pubPoint.Bytes()
+
+		var sigPoint bls12381.G2
+		test.CheckNoErr(t, sigPoint.SetBytes(sig), "failed to decode signature")
+		uncompressedSig = sigPoint.Bytes()
+	case bls.G2:
+		var pubPoint bls12381.G2
+		test.CheckNoErr(t, pubPoint.SetBytes(pubBytes), "failed to decode public key")
+		uncompressedPub = pubPoint.Bytes()
+
+		var sigPoint bls12381.G1
+		test.CheckNoErr(t, sigPoint.SetBytes(sig), "failed to decode signature")
+		uncompressedSig = sigPoint.Bytes()
+	}
+
+	decodedPub := new(bls.PublicKey[K])
+	test.CheckIsErr(t, decodedPub.UnmarshalBinary(uncompressedPub),
+		"should reject uncompressed public key")
+	test.CheckOk(!bls.Verify(pub, msg, uncompressedSig),
+		"should reject uncompressed signature", t)
+	_, err = bls.Aggregate(*new(K), []bls.Signature{uncompressedSig})
+	test.CheckIsErr(t, err, "should not aggregate uncompressed signature")
+	test.CheckOk(!bls.VerifyAggregate([]*bls.PublicKey[K]{pub}, [][]byte{msg}, uncompressedSig),
+		"should reject uncompressed aggregate signature", t)
+}
+
+func testNonCanonical[K bls.KeyGroup](t *testing.T) {
+	ikm := [32]byte{}
+	_, _ = rand.Reader.Read(ikm[:])
+
+	priv, err := bls.KeyGen[K](ikm[:], nil, nil)
+	test.CheckNoErr(t, err, "failed to keygen")
+	pub := priv.PublicKey()
+
+	msg := []byte("hello world")
+	sig := bls.Sign(priv, msg)
+	test.CheckOk(bls.Verify(pub, msg, sig), "baseline signature must verify", t)
+
+	longSig := append(append(bls.Signature{}, sig...), 0x00)
+	test.CheckOk(bls.Verify(pub, msg, longSig) == false,
+		"should fail: signature with trailing byte", t)
+
+	pubBytes, err := pub.MarshalBinary()
+	test.CheckNoErr(t, err, "failed to marshal public key")
+	longPub := new(bls.PublicKey[K])
+	err = longPub.UnmarshalBinary(append(append([]byte{}, pubBytes...), 0x00))
+	test.CheckIsErr(t, err, "should fail: public key with trailing byte")
 }
 
 func testBls[K bls.KeyGroup](t *testing.T) {
@@ -103,9 +172,14 @@ func testErrors[K bls.KeyGroup](t *testing.T) {
 	// Bad public key
 	msg := []byte("hello")
 	sig := bls.Sign[K](priv, msg)
-	pub = new(bls.PublicKey[K])
-	test.CheckOk(pub.Validate() == false, "should fail: bad public key", t)
-	test.CheckOk(bls.Verify(pub, msg, sig) == false, "should fail: bad signature", t)
+	badPub := new(bls.PublicKey[K])
+	test.CheckOk(badPub.Validate() == false, "should fail: bad public key", t)
+	test.CheckOk(bls.Verify(badPub, msg, sig) == false, "should fail: bad public key", t)
+
+	// Bad Signature equal to G.Identity
+	badSig := make(bls.Signature, len(sig))
+	badSig[0] = 0xC0
+	test.CheckOk(bls.Verify(pub, msg, badSig) == false, "should fail: bad signature", t)
 
 	// Bad private key
 	priv = new(bls.PrivateKey[K])
@@ -121,11 +195,18 @@ func testErrors[K bls.KeyGroup](t *testing.T) {
 	_, err = bls.Aggregate[K](*new(K), nil)
 	test.CheckIsErr(t, err, "should fail: empty signatures")
 
+	// Aggregate badSig
+	_, err = bls.Aggregate[K](*new(K), []bls.Signature{sig, badSig})
+	test.CheckIsErr(t, err, "should fail: bad signature")
+
 	// VerifyAggregate nil
 	test.CheckOk(bls.VerifyAggregate([]*bls.PublicKey[K]{}, nil, nil) == false, "should fail: empty keys", t)
 
 	// VerifyAggregate empty signature
 	test.CheckOk(bls.VerifyAggregate([]*bls.PublicKey[K]{pub}, [][]byte{msg}, nil) == false, "should fail: empty signature", t)
+
+	// VerifyAggregate bad aggregate signature
+	test.CheckOk(bls.VerifyAggregate([]*bls.PublicKey[K]{pub}, [][]byte{msg}, badSig) == false, "should fail: bad signature", t)
 }
 
 func testAggregation[K bls.KeyGroup](t *testing.T) {

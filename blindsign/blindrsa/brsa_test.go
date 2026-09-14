@@ -2,8 +2,10 @@ package blindrsa
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha512"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +16,8 @@ import (
 	"os"
 	"testing"
 
+	"github.com/cloudflare/circl/blindsign/blindrsa/internal/common"
+	"github.com/cloudflare/circl/blindsign/blindrsa/internal/keys"
 	"github.com/cloudflare/circl/internal/test"
 )
 
@@ -181,6 +185,55 @@ func TestDeterministicBlindFailure(t *testing.T) {
 	_, err = runSignatureProtocol(signer, client, message, nil)
 	if err == nil {
 		t.Fatal("Expected signature generation to fail with empty randomness")
+	}
+}
+
+// TestBlindRejectsNonCoprimeMessage ensures Blind enforces the RFC 9474
+// coprimality check. A malicious signer that publishes an invalid (even)
+// modulus would otherwise learn gcd(encoded_msg, N) from the blinded request,
+// leaking information about low-entropy deterministic messages. Since the
+// EMSA-PSS encoding always ends in the 0xbc trailer, the encoded message is
+// always even, so any even modulus shares the factor 2 with it.
+func TestBlindRejectsNonCoprimeMessage(t *testing.T) {
+	message := []byte("hello world")
+	key, err := loadPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Build a malicious public key with an even (invalid) modulus of the same
+	// bit length so that the EMSA-PSS encoding is unchanged.
+	maliciousN := new(big.Int).Set(key.N)
+	maliciousN.SetBit(maliciousN, 0, 0) // clear the low bit -> even modulus
+	maliciousPub := &rsa.PublicKey{N: maliciousN, E: key.E}
+
+	for _, variant := range []Variant{
+		SHA384PSSDeterministic,
+		SHA384PSSZeroDeterministic,
+		SHA384PSSRandomized,
+		SHA384PSSZeroRandomized,
+	} {
+		t.Run(variant.String(), func(tt *testing.T) {
+			client, err := NewClient(variant, maliciousPub)
+			if err != nil {
+				tt.Fatal(err)
+			}
+
+			inputMsg, err := client.Prepare(rand.Reader, message)
+			if err != nil {
+				tt.Fatal(err)
+			}
+
+			// Use an invertible blind (r = rInv = 1) so the coprimality
+			// check, rather than the blinding-factor invertibility check,
+			// is what rejects the request.
+			one := big.NewInt(1)
+			salt := make([]byte, client.v.SaltLength)
+			_, _, err = client.fixedBlind(inputMsg, salt, one, one)
+			if err != ErrInvalidMessage {
+				tt.Fatalf("expected ErrInvalidMessage, got %v", err)
+			}
+		})
 	}
 }
 
@@ -371,6 +424,70 @@ func TestVectors(t *testing.T) {
 	}
 }
 
+func TestNonCanonicalSignatureRejection(t *testing.T) {
+	message := []byte("hello world")
+	key, err := loadPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, variant := range []Variant{
+		SHA384PSSDeterministic,
+		SHA384PSSZeroDeterministic,
+		SHA384PSSRandomized,
+		SHA384PSSZeroRandomized,
+	} {
+		t.Run(variant.String(), func(tt *testing.T) {
+			client, err := NewClient(variant, &key.PublicKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			signer := NewSigner(key)
+
+			inputMsg, err := client.Prepare(rand.Reader, message)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			blindedMsg, state, err := client.Blind(rand.Reader, inputMsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			blindedSig, err := signer.BlindSign(blindedMsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			sig, err := client.Finalize(state, blindedSig)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Compute a non-canonical signature representative: s + N
+			s := new(big.Int).SetBytes(sig)
+			s.Add(s, key.N)
+
+			kLen := (key.N.BitLen() + 7) / 8
+			if s.BitLen() > kLen*8 {
+				// s + N overflows the fixed-width encoding, skip this test
+				return
+			}
+
+			sigPlusN := make([]byte, kLen)
+			s.FillBytes(sigPlusN)
+
+			if client.Verify(inputMsg, sigPlusN) == nil {
+				t.Fatal("expected verification to fail for non-canonical signature s+N")
+			}
+
+			if common.VerifyBlindSignature(keys.NewBigPublicKey(client.v.pk), state.encodedMsg, sigPlusN) == nil {
+				t.Fatal("expected VerifyBlindSignature to fail for non-canonical signature s+N")
+			}
+		})
+	}
+}
+
 func BenchmarkBRSA(b *testing.B) {
 	message := []byte("hello world")
 	key := loadStrongRSAKey()
@@ -498,4 +615,73 @@ func Example_blindrsa() {
 
 	fmt.Printf("Valid signature: %v", ok == nil)
 	// Output: Valid signature: true
+}
+
+func TestPSSZeroVerifierAcceptsSaltedSignatures(t *testing.T) {
+	key, err := loadPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	message := []byte("double-spendable token")
+
+	// Verifier configured for the zero-salt, deterministic variant.
+	verifier, err := NewVerifier(SHA384PSSZeroDeterministic, &key.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	digest := sha512.Sum384(message) // import "crypto/sha512"
+
+	// Standard PSS signatures with a 48-byte random salt over the same message.
+	// Under RFC 9474 PSSZERO these are INVALID (salt must be empty), and each
+	// signing run produces a different signature.
+	saltedSig1, err := rsa.SignPSS(rand.Reader, key, crypto.SHA384, digest[:],
+		&rsa.PSSOptions{Hash: crypto.SHA384, SaltLength: 48})
+	if err != nil {
+		t.Fatal(err)
+	}
+	saltedSig2, err := rsa.SignPSS(rand.Reader, key, crypto.SHA384, digest[:],
+		&rsa.PSSOptions{Hash: crypto.SHA384, SaltLength: 48})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(saltedSig1) == string(saltedSig2) {
+		t.Fatal("expected two distinct randomized-salt signatures")
+	}
+
+	// The PSSZERO verifier must reject both salted signatures. It does not.
+	if err = verifier.Verify(message, saltedSig1); err == nil {
+		t.Errorf("PSSZERO verifier accepted a 48-byte-salt PSS signature (#1)")
+	}
+	if err = verifier.Verify(message, saltedSig2); err == nil {
+		t.Errorf("PSSZERO verifier accepted a second, distinct 48-byte-salt PSS signature (#2) over the same message - signature uniqueness is broken")
+	}
+
+	// Cross-variant confusion: a full blind-signature run under the PSS
+	// (48-byte salt) variant also verifies under the PSSZERO verifier.
+	clientPSS, err := NewClient(SHA384PSSDeterministic, &key.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer := NewSigner(key)
+	inputMsg, err := clientPSS.Prepare(rand.Reader, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blindedMsg, state, err := clientPSS.Blind(rand.Reader, inputMsg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blindSig, err := signer.BlindSign(blindedMsg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pssSig, err := clientPSS.Finalize(state, blindSig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifier.Verify(inputMsg, pssSig); err == nil {
+		t.Errorf("PSSZERO verifier accepted an RSABSSA-SHA384-PSS (48-byte salt) blind signature")
+	}
 }

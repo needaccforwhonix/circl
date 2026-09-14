@@ -47,7 +47,7 @@ type PublicKey struct {
 	// Cached values
 	t1p [common.PolyT1Size * K]byte
 	A   *Mat
-	tr  *[TRSize]byte
+	tr  [TRSize]byte
 }
 
 // PrivateKey is the type of Dilithium private keys.
@@ -86,10 +86,9 @@ func (sig *unpackedSignature) Pack(buf []byte) {
 //
 // Returns whether buf contains a properly packed signature.
 func (sig *unpackedSignature) Unpack(buf []byte) bool {
-	if len(buf) < SignatureSize {
-		return false
-	}
-	if NIST && len(buf) != SignatureSize {
+	// NOTE: Previously the Dilithium (but not ML-DSA) implementation accepted
+	// signatures with trailing data.
+	if len(buf) != SignatureSize {
 		return false
 	}
 	copy(sig.c[:], buf[:])
@@ -119,7 +118,6 @@ func (pk *PublicKey) Unpack(buf *[PublicKeySize]byte) {
 	pk.A.Derive(&pk.rho)
 
 	// tr = CRH(ρ ‖ t1) = CRH(pk)
-	pk.tr = new([TRSize]byte)
 	h := sha3.NewShake256()
 	_, _ = h.Write(buf[:])
 	_, _ = h.Read(pk.tr[:])
@@ -235,7 +233,7 @@ func NewKeyFromSeed(seed *[common.SeedSize]byte) (*PublicKey, *PrivateKey) {
 	_, _ = h.Read(sk.tr[:])
 
 	// Finish cache of public key
-	pk.tr = &sk.tr
+	pk.tr = sk.tr
 
 	return &pk, &sk
 }
@@ -266,6 +264,14 @@ func (sk *PrivateKey) computeT0andT1(t0, t1 *VecK) {
 	t.Power2Round(t0, t1)
 }
 
+// computeMu writes μ = CRH(tr ‖ msg) into mu.
+func computeMu(tr *[TRSize]byte, msg func(io.Writer), mu *[64]byte) {
+	h := sha3.NewShake256()
+	_, _ = h.Write(tr[:])
+	msg(&h)
+	_, _ = h.Read(mu[:])
+}
+
 // Verify checks whether the given signature by pk on msg is valid.
 //
 // For Dilithium this is the top-level verification function.
@@ -285,11 +291,7 @@ func Verify(pk *PublicKey, msg func(io.Writer), signature []byte) bool {
 		return false
 	}
 
-	// μ = CRH(tr ‖ msg)
-	h := sha3.NewShake256()
-	_, _ = h.Write(pk.tr[:])
-	msg(&h)
-	_, _ = h.Read(mu[:])
+	computeMu(&pk.tr, msg, &mu)
 
 	// Compute Az
 	zh = sig.z
@@ -323,7 +325,7 @@ func Verify(pk *PublicKey, msg func(io.Writer), signature []byte) bool {
 	w1.PackW1(w1Packed[:])
 
 	// c' = H(μ, w₁)
-	h.Reset()
+	h := sha3.NewShake256()
 	_, _ = h.Write(mu[:])
 	_, _ = h.Write(w1Packed[:])
 	_, _ = h.Read(cp[:])
@@ -335,10 +337,18 @@ func Verify(pk *PublicKey, msg func(io.Writer), signature []byte) bool {
 //
 // For Dilithium this is the top-level signing function. For ML-DSA
 // this is ML-DSA.Sign_internal.
+func SignTo(sk *PrivateKey, msg func(io.Writer), rnd [32]byte, signature []byte) {
+	var mu [64]byte
+	computeMu(&sk.tr, msg, &mu)
+	SignMuTo(sk, &mu, rnd, signature)
+}
+
+// SignMuTo signs a supplied message representation μ and writes
+// out the signature. See appendix D of RFC 9881 for more context.
 //
 //nolint:funlen
-func SignTo(sk *PrivateKey, msg func(io.Writer), rnd [32]byte, signature []byte) {
-	var mu, rhop [64]byte
+func SignMuTo(sk *PrivateKey, mu *[64]byte, rnd [32]byte, signature []byte) {
+	var rhop [64]byte
 	var w1Packed [PolyW1Size * K]byte
 	var y, yh VecL
 	var w, w0, w1, w0mcs2, ct0, w0mcs2pct0 VecK
@@ -350,14 +360,8 @@ func SignTo(sk *PrivateKey, msg func(io.Writer), rnd [32]byte, signature []byte)
 		panic("Signature does not fit in that byteslice")
 	}
 
-	//  μ = CRH(tr ‖ msg)
-	h := sha3.NewShake256()
-	_, _ = h.Write(sk.tr[:])
-	msg(&h)
-	_, _ = h.Read(mu[:])
-
 	// ρ' = CRH(key ‖ μ)
-	h.Reset()
+	h := sha3.NewShake256()
 	_, _ = h.Write(sk.key[:])
 	if NIST {
 		_, _ = h.Write(rnd[:])
@@ -475,7 +479,7 @@ func (sk *PrivateKey) Public() *PublicKey {
 	pk := &PublicKey{
 		rho: sk.rho,
 		A:   &sk.A,
-		tr:  &sk.tr,
+		tr:  sk.tr,
 	}
 	sk.computeT0andT1(&t0, &pk.t1)
 	pk.t1.PackT1(pk.t1p[:])
